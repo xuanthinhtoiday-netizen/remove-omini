@@ -1,9 +1,14 @@
+import JSZip from 'jszip';
 import {
   CheckCircle2,
+  CopyCheck,
   Download,
   Film,
   Focus,
+  Layers,
   Loader2,
+  Play,
+  Plus,
   RotateCcw,
   Scan,
   ShieldCheck,
@@ -12,9 +17,10 @@ import {
   UploadCloud,
   Volume2,
   Wand2,
+  X,
   Zap,
 } from 'lucide-react';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cleanFrameExact,
   detectVideoWatermark,
@@ -36,91 +42,143 @@ import {
 } from '../engine/mediabunnyVideo';
 import { loadReferenceMasks } from '../engine/referenceMasks';
 
+interface VideoQueueEntry {
+  id: string;
+  file: File;
+  name: string;
+  thumbUrl: string;
+  previewFrame: VideoPreviewFrame;
+  baseBox: WatermarkBox;
+  detection: DetectionResult<VideoPresetKey>;
+  presetKey: VideoPresetKey;
+  tuner: TunerParams;
+  status: 'idle' | 'processing' | 'done' | 'error';
+  progressPct: number;
+  framesDone: number;
+  phaseLabel: string;
+  result?: VideoExportResult;
+  errorMessage?: string;
+}
+
 interface VideoStudioProps {
   onNotify: (msg: string) => void;
 }
 
+function imageDataToThumbUrl(imageData: ImageData, maxW = 240): string {
+  const scale = Math.min(1, maxW / imageData.width);
+  const w = Math.max(1, Math.round(imageData.width * scale));
+  const h = Math.max(1, Math.round(imageData.height * scale));
+  const src = document.createElement('canvas');
+  src.width = imageData.width;
+  src.height = imageData.height;
+  src.getContext('2d')!.putImageData(imageData, 0, 0);
+
+  const dst = document.createElement('canvas');
+  dst.width = w;
+  dst.height = h;
+  dst.getContext('2d')!.drawImage(src, 0, 0, w, h);
+  return dst.toDataURL('image/jpeg', 0.78);
+}
+
 export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
-  const [file, setFile] = useState<File | null>(null);
-  const [previewFrame, setPreviewFrame] = useState<VideoPreviewFrame | null>(null);
-  const [baseBox, setBaseBox] = useState<WatermarkBox | null>(null);
-  const [detection, setDetection] = useState<DetectionResult<VideoPresetKey> | null>(null);
-  const [presetKey, setPresetKey] = useState<VideoPresetKey>('veo');
-  const [tuner, setTuner] = useState<TunerParams>({
-    gain: 0.6,
-    offsetX: -24,
-    offsetY: -24,
-    sizeScale: 1.0,
-  });
+  const [entries, setEntries] = useState<VideoQueueEntry[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<'tuner' | 'result'>('tuner');
 
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzingProgress, setAnalyzingProgress] = useState('');
   const [showGuideBox, setShowGuideBox] = useState(true);
   const [cleanedFrameUrl, setCleanedFrameUrl] = useState<string | null>(null);
 
-  const [isExporting, setIsExporting] = useState(false);
-  const [progressPct, setProgressPct] = useState(0);
-  const [framesDone, setFramesDone] = useState(0);
-  const [phaseLabel, setPhaseLabel] = useState('');
-  const [exportResult, setExportResult] = useState<VideoExportResult | null>(null);
+  const [isExportingBatch, setIsExportingBatch] = useState(false);
+  const [batchCounter, setBatchCounter] = useState<{ current: number; total: number } | null>(null);
+  const [isZipping, setIsZipping] = useState(false);
 
   const bg96Ref = useRef<HTMLImageElement | null>(null);
   const zoomOrigRef = useRef<HTMLCanvasElement | null>(null);
   const zoomCleanRef = useRef<HTMLCanvasElement | null>(null);
   const frameBoxRef = useRef<HTMLDivElement | null>(null);
+  const addMoreInputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const dragRef = useRef<{ startX: number; startY: number; initOffX: number; initOffY: number } | null>(null);
+  const dragRef = useRef<{ startX: number; startY: number; initOffX: number; initOffY: number } | null>(
+    null
+  );
 
-  const handleVideoFile = async (selected: File) => {
-    if (!selected.type.startsWith('video/')) {
+  const activeEntry = entries.find((e) => e.id === activeId) ?? entries[0] ?? null;
+
+  const updateEntry = useCallback((id: string, patch: Partial<VideoQueueEntry>) => {
+    setEntries((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  }, []);
+
+  const handleVideoFiles = async (fileList: FileList | File[]) => {
+    const valid = Array.from(fileList).filter((f) => f.type.startsWith('video/'));
+    if (valid.length === 0) {
       onNotify('Vui lòng chọn file video hợp lệ (MP4, WebM, MOV).');
       return;
     }
 
-    if (exportResult) {
-      URL.revokeObjectURL(exportResult.url);
-      URL.revokeObjectURL(exportResult.originalUrl);
-      setExportResult(null);
-    }
-
     setIsAnalyzing(true);
     try {
-      const [{ bg96 }, frame] = await Promise.all([
-        loadReferenceMasks(),
-        grabBestVideoPreviewFrame(selected),
-      ]);
+      const { bg96 } = await loadReferenceMasks();
       bg96Ref.current = bg96;
 
-      const base = getVideoWatermarkBase(frame.width, frame.height);
-      const det = detectVideoWatermark(frame.imageData, frame.width, frame.height, bg96);
+      const added: VideoQueueEntry[] = [];
+      for (let i = 0; i < valid.length; i++) {
+        const selected = valid[i];
+        setAnalyzingProgress(`Đang phân tích video ${i + 1}/${valid.length}: ${selected.name}`);
+        try {
+          const frame = await grabBestVideoPreviewFrame(selected);
+          const baseBox = getVideoWatermarkBase(frame.width, frame.height);
+          const detection = detectVideoWatermark(frame.imageData, frame.width, frame.height, bg96);
+          const thumbUrl = imageDataToThumbUrl(frame.imageData);
 
-      setFile(selected);
-      setPreviewFrame(frame);
-      setBaseBox(base);
-      setDetection(det);
-      setPresetKey(det.presetKey);
-      setTuner({
-        gain: det.gain,
-        offsetX: det.offsetX,
-        offsetY: det.offsetY,
-        sizeScale: det.sizeScale,
-      });
+          added.push({
+            id: `vid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            file: selected,
+            name: selected.name,
+            thumbUrl,
+            previewFrame: frame,
+            baseBox,
+            detection,
+            presetKey: detection.presetKey,
+            tuner: {
+              gain: detection.gain,
+              offsetX: detection.offsetX,
+              offsetY: detection.offsetY,
+              sizeScale: detection.sizeScale,
+            },
+            status: 'idle',
+            progressPct: 0,
+            framesDone: 0,
+            phaseLabel: '',
+          });
+        } catch (err) {
+          onNotify(
+            `Không đọc được "${selected.name}": ${err instanceof Error ? err.message : 'Lỗi file'}`
+          );
+        }
+      }
 
-      onNotify(
-        det.matchFound
-          ? `Đã tự động khóa logo Video: ${det.name} (${Math.round(det.score * 100)}% khớp)!`
-          : `Đã trích xuất khung hình video — áp dụng preset Gemini Omni / Veo 3!`
-      );
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Không thể phân tích video này.');
+      if (added.length > 0) {
+        setEntries((prev) => [...prev, ...added]);
+        setActiveId((prev) => prev ?? added[0].id);
+        setViewMode('tuner');
+        onNotify(
+          added.length === 1
+            ? `Đã tải & tự nhận diện logo cho "${added[0].name}"!`
+            : `Đã thêm ${added.length} video vào hàng đợi và tự nhận diện logo cho từng video!`
+        );
+      }
     } finally {
       setIsAnalyzing(false);
+      setAnalyzingProgress('');
     }
   };
 
-  // Live 60fps Preview Frame + Dual Zoomed Comparison Canvas!
+  // Live 60fps Preview Frame + Dual Zoomed Comparison Canvas for Active Video!
   useEffect(() => {
-    if (!previewFrame || !baseBox) return;
+    if (!activeEntry || viewMode !== 'tuner') return;
     let cancelled = false;
 
     const renderLive = async () => {
@@ -130,6 +188,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
       }
       if (cancelled || !bg96Ref.current) return;
 
+      const { previewFrame, baseBox, tuner } = activeEntry;
       const { width, height, imageData } = previewFrame;
       const copy = new ImageData(new Uint8ClampedArray(imageData.data), width, height);
       const { wm, roi } = cleanFrameExact(bg96Ref.current, copy, width, height, baseBox, tuner);
@@ -181,17 +240,19 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
     return () => {
       cancelled = true;
     };
-  }, [previewFrame, baseBox, tuner, showGuideBox]);
+  }, [activeEntry, viewMode, showGuideBox]);
 
-  // Drag guide box directly on video preview frame
+  // Drag guide box directly on active video frame
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
-      if (!dragRef.current || !frameBoxRef.current || !previewFrame) return;
+      if (!dragRef.current || !frameBoxRef.current || !activeEntry) return;
       const rect = frameBoxRef.current.getBoundingClientRect();
       const { startX, startY, initOffX, initOffY } = dragRef.current;
-      const dx = Math.round(((e.clientX - startX) / rect.width) * previewFrame.width);
-      const dy = Math.round(((e.clientY - startY) / rect.height) * previewFrame.height);
-      setTuner((prev) => ({ ...prev, offsetX: initOffX + dx, offsetY: initOffY + dy }));
+      const dx = Math.round(((e.clientX - startX) / rect.width) * activeEntry.previewFrame.width);
+      const dy = Math.round(((e.clientY - startY) / rect.height) * activeEntry.previewFrame.height);
+      updateEntry(activeEntry.id, {
+        tuner: { ...activeEntry.tuner, offsetX: initOffX + dx, offsetY: initOffY + dy },
+      });
     };
     const onUp = () => {
       dragRef.current = null;
@@ -202,119 +263,233 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
-  }, [previewFrame]);
+  }, [activeEntry, updateEntry]);
+
+  const updateActiveTuner = (patch: Partial<TunerParams>, nextPreset?: VideoPresetKey) => {
+    if (!activeEntry) return;
+    updateEntry(activeEntry.id, {
+      tuner: { ...activeEntry.tuner, ...patch },
+      presetKey: nextPreset ?? activeEntry.presetKey,
+    });
+  };
 
   const handleApplyPreset = (key: VideoPresetKey) => {
-    if (!previewFrame) return;
-    setPresetKey(key);
-    setTuner(getAdaptiveVideoPreset(key, previewFrame.width, previewFrame.height));
+    if (!activeEntry) return;
+    const p = getAdaptiveVideoPreset(key, activeEntry.previewFrame.width, activeEntry.previewFrame.height);
+    updateActiveTuner(p, key);
+  };
+
+  const handleSyncSettingsToAll = () => {
+    if (!activeEntry || entries.length <= 1) return;
+    setEntries((prev) =>
+      prev.map((it) => ({
+        ...it,
+        presetKey: activeEntry.presetKey,
+        tuner: { ...activeEntry.tuner },
+      }))
+    );
+    onNotify(`Đã đồng bộ thông số Live Tuner cho toàn bộ ${entries.length} video!`);
   };
 
   const handleAutoDetectAgain = async () => {
-    if (!previewFrame) return;
+    if (!activeEntry) return;
     const { bg96 } = await loadReferenceMasks();
-    const det = detectVideoWatermark(previewFrame.imageData, previewFrame.width, previewFrame.height, bg96);
-    setDetection(det);
-    setPresetKey(det.presetKey);
-    setTuner({
-      gain: det.gain,
-      offsetX: det.offsetX,
-      offsetY: det.offsetY,
-      sizeScale: det.sizeScale,
+    const det = detectVideoWatermark(
+      activeEntry.previewFrame.imageData,
+      activeEntry.previewFrame.width,
+      activeEntry.previewFrame.height,
+      bg96
+    );
+    updateEntry(activeEntry.id, {
+      detection: det,
+      presetKey: det.presetKey,
+      tuner: {
+        gain: det.gain,
+        offsetX: det.offsetX,
+        offsetY: det.offsetY,
+        sizeScale: det.sizeScale,
+      },
     });
-    onNotify(`Auto-Detect Video: ${det.name} (${Math.round(det.score * 100)}% khớp)`);
+    onNotify(`Auto-Detect: ${det.name} (${Math.round(det.score * 100)}% khớp)`);
   };
 
   const handleAutoGain = async () => {
-    if (!previewFrame || !baseBox) return;
+    if (!activeEntry) return;
     const { bg96 } = await loadReferenceMasks();
-    const wm = resolveWatermarkBox(baseBox, previewFrame.width, previewFrame.height, tuner);
+    const wm = resolveWatermarkBox(
+      activeEntry.baseBox,
+      activeEntry.previewFrame.width,
+      activeEntry.previewFrame.height,
+      activeEntry.tuner
+    );
     const optimal = estimateOptimalGain(
-      previewFrame.imageData,
-      previewFrame.width,
-      previewFrame.height,
+      activeEntry.previewFrame.imageData,
+      activeEntry.previewFrame.width,
+      activeEntry.previewFrame.height,
       bg96,
       wm,
-      tuner.gain
+      activeEntry.tuner.gain
     );
-    setTuner((prev) => ({ ...prev, gain: optimal }));
-    onNotify(`Đã tối ưu Độ mạnh Alpha cho video: ${optimal.toFixed(2)}x`);
+    updateActiveTuner({ gain: optimal });
+    onNotify(`Đã tối ưu Độ mạnh Alpha: ${optimal.toFixed(2)}x`);
   };
 
-  const handleExportVideo = async () => {
-    if (!file) return;
-    setIsExporting(true);
-    setProgressPct(0);
-    setFramesDone(0);
-    setPhaseLabel('Đang khởi tạo WebCodecs H.264...');
-    setExportResult(null);
+  const processListSequentially = async (targets: VideoQueueEntry[]) => {
+    if (targets.length === 0) return;
+    setIsExportingBatch(true);
+    setBatchCounter({ current: 1, total: targets.length });
 
     const controller = new AbortController();
     abortRef.current = controller;
 
-    try {
-      const res = await exportCleanedVideoMp4(
-        file,
-        tuner,
-        (pct, count, phase) => {
-          setProgressPct(pct);
-          setFramesDone(count);
-          setPhaseLabel(phase);
-        },
-        controller.signal
-      );
-      setExportResult(res);
+    let completed = 0;
+
+    for (let i = 0; i < targets.length; i++) {
+      if (controller.signal.aborted) break;
+      const item = targets[i];
+      setBatchCounter({ current: i + 1, total: targets.length });
+      setActiveId(item.id);
+
+      // Revoke old result URLs if re-exporting
+      if (item.result) {
+        URL.revokeObjectURL(item.result.url);
+        URL.revokeObjectURL(item.result.originalUrl);
+      }
+
+      updateEntry(item.id, {
+        status: 'processing',
+        progressPct: 0,
+        framesDone: 0,
+        phaseLabel: 'Đang khởi tạo WebCodecs H.264...',
+        errorMessage: undefined,
+      });
+
+      try {
+        const res = await exportCleanedVideoMp4(
+          item.file,
+          item.tuner,
+          (pct, count, phase) => {
+            updateEntry(item.id, {
+              progressPct: pct,
+              framesDone: count,
+              phaseLabel: phase,
+            });
+          },
+          controller.signal
+        );
+        updateEntry(item.id, {
+          status: 'done',
+          progressPct: 100,
+          result: res,
+          phaseLabel: 'Hoàn tất!',
+        });
+        completed++;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          updateEntry(item.id, { status: 'idle', progressPct: 0, phaseLabel: 'Đã dừng' });
+          break;
+        }
+        updateEntry(item.id, {
+          status: 'error',
+          errorMessage: err instanceof Error ? err.message : 'Lỗi xử lý video',
+          phaseLabel: 'Lỗi xử lý',
+        });
+      }
+    }
+
+    setIsExportingBatch(false);
+    setBatchCounter(null);
+    abortRef.current = null;
+
+    if (completed > 0) {
+      setViewMode('result');
       onNotify(
-        res.hasAudio
-          ? `Xuất thành công video MP4 sạch (${res.frameCount} khung hình · giữ nguyên âm thanh gốc)!`
-          : `Xuất thành công video MP4 sạch (${res.frameCount} khung hình)!`
+        targets.length === 1
+          ? 'Đã xuất video MP4 sạch thành công (giữ nguyên âm thanh gốc)!'
+          : `Đã xử lý xong hàng loạt ${completed}/${targets.length} video MP4 sạch!`
       );
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'Lỗi khi xuất video.');
-    } finally {
-      setIsExporting(false);
-      abortRef.current = null;
     }
   };
 
-  const handleDownloadVideo = () => {
-    if (!exportResult || !file) return;
-    const baseName = file.name.replace(/\.[^.]+$/, '');
+  const handleExportCurrent = () => {
+    if (!activeEntry) return;
+    void processListSequentially([activeEntry]);
+  };
+
+  const handleExportAllPending = () => {
+    const pending = entries.filter((e) => e.status !== 'done');
+    const targets = pending.length > 0 ? pending : entries;
+    void processListSequentially(targets);
+  };
+
+  const handleDownloadSingle = (entry: VideoQueueEntry) => {
+    if (!entry.result) return;
+    const baseName = entry.name.replace(/\.[^.]+$/, '');
     const a = document.createElement('a');
-    a.href = exportResult.url;
+    a.href = entry.result.url;
     a.download = `clean_${baseName}.mp4`;
     a.click();
   };
 
-  const handleResetAll = () => {
-    if (exportResult) {
-      URL.revokeObjectURL(exportResult.url);
-      URL.revokeObjectURL(exportResult.originalUrl);
+  const handleDownloadAllZip = async () => {
+    const doneEntries = entries.filter((e) => e.status === 'done' && e.result);
+    if (doneEntries.length === 0) return;
+
+    setIsZipping(true);
+    try {
+      const zip = new JSZip();
+      for (const entry of doneEntries) {
+        const baseName = entry.name.replace(/\.[^.]+$/, '');
+        // STORE (no re-compression) makes zipping MP4 videos instantaneous!
+        zip.file(`clean_${baseName}.mp4`, entry.result!.blob, { compression: 'STORE' });
+      }
+      const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `AuraErase_Clean_${doneEntries.length}_Videos.zip`;
+      a.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 6000);
+      onNotify(`Đã tải gói ZIP gồm ${doneEntries.length} video MP4 sạch!`);
+    } finally {
+      setIsZipping(false);
     }
-    setFile(null);
-    setPreviewFrame(null);
-    setBaseBox(null);
-    setDetection(null);
-    setExportResult(null);
-    setCleanedFrameUrl(null);
   };
 
+  const handleRemoveEntry = (id: string) => {
+    setEntries((prev) => {
+      const target = prev.find((e) => e.id === id);
+      if (target?.result) {
+        URL.revokeObjectURL(target.result.url);
+        URL.revokeObjectURL(target.result.originalUrl);
+      }
+      const next = prev.filter((e) => e.id !== id);
+      if (activeId === id) {
+        setActiveId(next[0]?.id ?? null);
+      }
+      if (next.length === 0) setViewMode('tuner');
+      return next;
+    });
+  };
+
+  const doneCount = entries.filter((e) => e.status === 'done').length;
+
   // Empty Video Dropzone
-  if (!file || !previewFrame || !baseBox) {
+  if (!activeEntry) {
     return (
       <section className="dropzone-stage">
         <div className="hero-header">
           <div className="hero-pill">
             <Film size={14} />
-            <span>WebCodecs H.264 MP4 · Giữ 100% Âm Thanh Gốc · Gemini Omni / Flow / Veo 3</span>
+            <span>Hỗ trợ Hàng Loạt Nhiều Video · WebCodecs H.264 MP4 · Giữ 100% Âm Thanh</span>
           </div>
           <h1 className="hero-title">
-            Xóa Logo <span>Video Omni &amp; Veo 3</span> siêu tốc
+            Xóa Logo <span>Video Omni &amp; Veo 3</span> hàng loạt
           </h1>
           <p className="hero-desc">
-            Sử dụng công nghệ <strong>WebCodecs + MediaBunny</strong> giải mã &amp; khử watermark bằng
-            Reverse Alpha chuẩn toán học từng khung hình, xuất trực tiếp file <strong>MP4 H.264</strong>{' '}
-            giữ nguyên 100% âm thanh gốc mà không gửi video lên máy chủ.
+            Kéo thả <strong>1 hoặc nhiều video cùng lúc</strong> (Gemini Omni, Google Flow, Veo 3).
+            Tự động nhận diện logo cho từng video, chỉnh Live Tuner 60fps rồi chạy hàng đợi xuất{' '}
+            <strong>MP4 H.264</strong> giữ nguyên âm thanh gốc &amp; tải về trọn bộ <strong>ZIP</strong>.
           </p>
         </div>
 
@@ -328,17 +503,16 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
           onDrop={(e) => {
             e.preventDefault();
             setIsDragging(false);
-            const f = e.dataTransfer.files?.[0];
-            if (f) void handleVideoFile(f);
+            if (e.dataTransfer.files?.length) void handleVideoFiles(e.dataTransfer.files);
           }}
         >
           <input
             type="file"
             accept="video/*"
+            multiple
             style={{ display: 'none' }}
             onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void handleVideoFile(f);
+              if (e.target.files?.length) void handleVideoFiles(e.target.files);
               e.target.value = '';
             }}
           />
@@ -352,411 +526,591 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({ onNotify }) => {
           <div style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>
               {isAnalyzing
-                ? 'Đang quét khung hình đẹp nhất & tự nhận diện logo Omni / Veo...'
-                : 'Kéo thả Video Gemini Omni / Flow / Veo 3 vào đây'}
+                ? analyzingProgress || 'Đang phân tích khung hình & tự nhận diện logo...'
+                : 'Kéo thả 1 hoặc nhiều Video AI vào đây'}
             </div>
             <div style={{ fontSize: 13.5, color: 'var(--text-secondary)' }}>
-              Hỗ trợ MP4 · WebM · MOV · Xuất MP4 chất lượng cao giữ nguyên âm thanh gốc
+              Chọn cùng lúc nhiều file MP4 / WebM / MOV · Xuất hàng loạt + tải ZIP tức thì
             </div>
           </div>
           <div className="format-chips">
+            <span className="format-chip">Batch Multi-Video</span>
             <span className="format-chip">Gemini Omni</span>
-            <span className="format-chip">Google Flow</span>
-            <span className="format-chip">Veo 3</span>
-            <span className="format-chip">H.264 MP4 + Audio Passthrough</span>
+            <span className="format-chip">Google Flow / Veo 3</span>
+            <span className="format-chip">MP4 H.264 + Audio Passthrough</span>
           </div>
         </label>
 
         <div className="feature-strip">
           <div className="feature-item">
+            <Layers size={15} color="#c084fc" />
+            <span>Hàng đợi thông minh — Xử lý liên tục nhiều video</span>
+          </div>
+          <div className="feature-item">
             <Volume2 size={15} color="#34d399" />
-            <span>Audio Passthrough — Giữ nguyên 100% âm thanh</span>
+            <span>Giữ nguyên 100% âm thanh gốc</span>
           </div>
           <div className="feature-item">
-            <Zap size={15} color="#38bdf8" />
-            <span>Tăng tốc phần cứng WebCodecs (nhanh hơn real-time)</span>
-          </div>
-          <div className="feature-item">
-            <ShieldCheck size={15} color="#c084fc" />
-            <span>{isWebCodecsVideoSupported() ? 'Trình duyệt đã sẵn sàng WebCodecs' : 'Khuyên dùng Chrome / Edge'}</span>
+            <ShieldCheck size={15} color="#38bdf8" />
+            <span>
+              {isWebCodecsVideoSupported()
+                ? 'Trình duyệt đã sẵn sàng tăng tốc WebCodecs'
+                : 'Khuyên dùng Chrome / Edge desktop'}
+            </span>
           </div>
         </div>
       </section>
     );
   }
 
-  // Exported Result Comparison View
-  if (exportResult) {
-    return (
-      <div className="glass-panel" style={{ borderRadius: 24, padding: 24, maxWidth: 1120, margin: '0 auto', width: '100%' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 18 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <CheckCircle2 size={24} color="#34d399" />
-            <div>
-              <h2 style={{ fontSize: 19, fontWeight: 700 }}>Đã xóa sạch Watermark Video MP4!</h2>
-              <p style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                {exportResult.width}×{exportResult.height}px · {exportResult.frameCount} khung hình ·{' '}
-                {exportResult.hasAudio ? 'Đã giữ nguyên âm thanh gốc' : 'Video không có track âm thanh'}
-              </p>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button type="button" className="btn btn-ghost" onClick={() => setExportResult(null)}>
-              <RotateCcw size={15} />
-              <span>Chỉnh lại Live Tuner</span>
-            </button>
-            <button type="button" className="btn btn-ghost" onClick={handleResetAll}>
-              <UploadCloud size={15} />
-              <span>Chọn video khác</span>
-            </button>
-            <button type="button" className="btn btn-success" onClick={handleDownloadVideo}>
-              <Download size={16} />
-              <span>Tải Video MP4 Sạch</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="video-compare-grid">
-          <div className="video-result-box">
-            <div className="zoom-card-head">
-              <span className="dot blue" />
-              <span>Video Gốc (Có Logo)</span>
-            </div>
-            <video src={exportResult.originalUrl} controls playsInline />
-          </div>
-          <div className="video-result-box clean">
-            <div className="zoom-card-head">
-              <span className="dot green" />
-              <span>Video Sau Khi Xóa Logo (MP4 Sạch)</span>
-            </div>
-            <video src={exportResult.url} controls playsInline />
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const wm = resolveWatermarkBox(baseBox, previewFrame.width, previewFrame.height, tuner);
-  const offXMin = -Math.round(previewFrame.width * 0.45);
-  const offXMax = Math.round(previewFrame.width * 0.25);
-  const offYMin = -Math.round(previewFrame.height * 0.45);
-  const offYMax = Math.round(previewFrame.height * 0.25);
+  const wm = resolveWatermarkBox(
+    activeEntry.baseBox,
+    activeEntry.previewFrame.width,
+    activeEntry.previewFrame.height,
+    activeEntry.tuner
+  );
+  const offXMin = -Math.round(activeEntry.previewFrame.width * 0.45);
+  const offXMax = Math.round(activeEntry.previewFrame.width * 0.25);
+  const offYMin = -Math.round(activeEntry.previewFrame.height * 0.45);
+  const offYMax = Math.round(activeEntry.previewFrame.height * 0.25);
 
   return (
-    <div className="studio-grid">
-      {/* Left Video Frame Live Tuner + Dual Zoomed Comparison */}
-      <div className="canvas-stage-panel glass-panel">
-        <div className="tuner-status-strip">
-          <div className="detect-pill">
-            <Scan size={14} color={detection?.matchFound ? '#34d399' : '#fbbf24'} />
-            <span>
-              {detection?.matchFound ? (
-                <>
-                  Tự nhận diện Video: <strong>{detection.name}</strong> ·{' '}
-                  <span style={{ color: '#34d399' }}>{Math.round(detection.score * 100)}% khớp</span>
-                </>
-              ) : (
-                <>
-                  Áp dụng chuẩn: <strong>{detection?.name ?? 'Gemini Omni / Veo 3'}</strong>
-                </>
+    <>
+      <input
+        ref={addMoreInputRef}
+        type="file"
+        accept="video/*"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          if (e.target.files?.length) void handleVideoFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+
+      <div className="studio-grid">
+        {/* Left Main Stage: Either Live Tuner OR Completed Side-by-Side Player */}
+        <div className="canvas-stage-panel glass-panel">
+          <div className="tuner-status-strip">
+            <div className="detect-pill">
+              <Scan size={14} color={activeEntry.detection.matchFound ? '#34d399' : '#fbbf24'} />
+              <span>
+                <strong>{activeEntry.name}</strong> ·{' '}
+                {activeEntry.detection.matchFound ? (
+                  <span style={{ color: '#34d399' }}>
+                    {activeEntry.detection.name} ({Math.round(activeEntry.detection.score * 100)}%)
+                  </span>
+                ) : (
+                  <span>{activeEntry.detection.name}</span>
+                )}
+              </span>
+            </div>
+
+            <div className="hud-group">
+              {activeEntry.result && (
+                <button
+                  type="button"
+                  className={`hud-btn ${viewMode === 'result' ? 'active' : ''}`}
+                  onClick={() => setViewMode((m) => (m === 'result' ? 'tuner' : 'result'))}
+                >
+                  <Play size={14} />
+                  <span>{viewMode === 'result' ? 'Về Live Tuner' : 'Xem Video Đã Xóa'}</span>
+                </button>
               )}
-            </span>
-          </div>
-
-          <div className="hud-group">
-            <button
-              type="button"
-              className={`hud-btn ${showGuideBox ? 'active' : ''}`}
-              onClick={() => setShowGuideBox((v) => !v)}
-            >
-              <Focus size={14} />
-              <span>Khung vị trí</span>
-            </button>
-            <button type="button" className="hud-btn" onClick={handleResetAll}>
-              <UploadCloud size={14} />
-              <span>Đổi video</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="canvas-viewport" style={{ padding: 20 }}>
-          <div
-            ref={frameBoxRef}
-            className="canvas-frame-wrapper"
-            style={{
-              width: 'min(100%, 840px)',
-              aspectRatio: `${previewFrame.width} / ${previewFrame.height}`,
-            }}
-          >
-            {cleanedFrameUrl && (
-              <img
-                src={cleanedFrameUrl}
-                alt="Video Frame Preview"
-                className="canvas-img"
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-              />
-            )}
-
-            {showGuideBox && (
-              <div
-                className="roi-box"
-                style={{
-                  left: `${(wm.x / previewFrame.width) * 100}%`,
-                  top: `${(wm.y / previewFrame.height) * 100}%`,
-                  width: `${(wm.width / previewFrame.width) * 100}%`,
-                  height: `${(wm.height / previewFrame.height) * 100}%`,
-                }}
-                title="Kéo khung để căn chuẩn vị trí logo video"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  dragRef.current = {
-                    startX: e.clientX,
-                    startY: e.clientY,
-                    initOffX: tuner.offsetX,
-                    initOffY: tuner.offsetY,
-                  };
-                }}
+              {viewMode === 'tuner' && (
+                <button
+                  type="button"
+                  className={`hud-btn ${showGuideBox ? 'active' : ''}`}
+                  onClick={() => setShowGuideBox((v) => !v)}
+                >
+                  <Focus size={14} />
+                  <span>Khung vị trí</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className="hud-btn"
+                disabled={isAnalyzing || isExportingBatch}
+                onClick={() => addMoreInputRef.current?.click()}
               >
-                <div className="roi-label">
-                  ✦ Video {wm.size}×{wm.size}px · α={tuner.gain.toFixed(2)}x
+                <Plus size={14} />
+                <span>Thêm video</span>
+              </button>
+            </div>
+          </div>
+
+          {viewMode === 'result' && activeEntry.result ? (
+            <div style={{ padding: 20, flex: 1, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="video-compare-grid">
+                <div className="video-result-box">
+                  <div className="zoom-card-head">
+                    <span className="dot blue" />
+                    <span>Video Gốc (Có Logo)</span>
+                  </div>
+                  <video src={activeEntry.result.originalUrl} controls playsInline />
+                </div>
+                <div className="video-result-box clean">
+                  <div className="zoom-card-head">
+                    <span className="dot green" />
+                    <span>Video Sau Khi Xóa Logo (MP4 Sạch)</span>
+                  </div>
+                  <video src={activeEntry.result.url} controls playsInline />
                 </div>
               </div>
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 10 }}>
+                <button
+                  type="button"
+                  className="btn btn-success"
+                  onClick={() => handleDownloadSingle(activeEntry)}
+                >
+                  <Download size={16} />
+                  <span>Tải video này (.MP4)</span>
+                </button>
+                {doneCount >= 2 && (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={isZipping}
+                    onClick={() => void handleDownloadAllZip()}
+                  >
+                    {isZipping ? <Loader2 size={15} className="spin" /> : <Download size={15} />}
+                    <span>Tải tất cả {doneCount} video (ZIP)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="canvas-viewport" style={{ padding: 20 }}>
+                <div
+                  ref={frameBoxRef}
+                  className="canvas-frame-wrapper"
+                  style={{
+                    width: 'min(100%, 840px)',
+                    aspectRatio: `${activeEntry.previewFrame.width} / ${activeEntry.previewFrame.height}`,
+                  }}
+                >
+                  {cleanedFrameUrl && (
+                    <img
+                      src={cleanedFrameUrl}
+                      alt={activeEntry.name}
+                      className="canvas-img"
+                      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                    />
+                  )}
+
+                  {showGuideBox && (
+                    <div
+                      className="roi-box"
+                      style={{
+                        left: `${(wm.x / activeEntry.previewFrame.width) * 100}%`,
+                        top: `${(wm.y / activeEntry.previewFrame.height) * 100}%`,
+                        width: `${(wm.width / activeEntry.previewFrame.width) * 100}%`,
+                        height: `${(wm.height / activeEntry.previewFrame.height) * 100}%`,
+                      }}
+                      title="Kéo khung để căn chuẩn vị trí logo video"
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        dragRef.current = {
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          initOffX: activeEntry.tuner.offsetX,
+                          initOffY: activeEntry.tuner.offsetY,
+                        };
+                      }}
+                    >
+                      <div className="roi-label">
+                        ✦ {wm.size}×{wm.size}px · α={activeEntry.tuner.gain.toFixed(2)}x
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="dual-zoom-bar">
+                <div className="zoom-card">
+                  <div className="zoom-card-head">
+                    <span className="dot blue" />
+                    <span>Khung hình GỐC (Zoom góc logo)</span>
+                  </div>
+                  <canvas ref={zoomOrigRef} width={220} height={220} />
+                </div>
+
+                <div className="zoom-card clean">
+                  <div className="zoom-card-head">
+                    <span className="dot green" />
+                    <span>Khung hình ĐÃ XÓA (Live 60fps)</span>
+                  </div>
+                  <canvas ref={zoomCleanRef} width={220} height={220} />
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Right Video Controls */}
+        <aside className="inspector-panel glass-panel">
+          <div className="inspector-section">
+            <div className="section-label">
+              <span>Model Preset Video</span>
+            </div>
+            <div className="algo-list">
+              <button
+                type="button"
+                className={`algo-pill ${activeEntry.presetKey === 'veo' ? 'active' : ''}`}
+                onClick={() => handleApplyPreset('veo')}
+              >
+                <strong>Omni / Veo 3</strong>
+                <span>Inset chuẩn</span>
+              </button>
+              <button
+                type="button"
+                className={`algo-pill ${activeEntry.presetKey === 'corner' ? 'active' : ''}`}
+                onClick={() => handleApplyPreset('corner')}
+              >
+                <strong>Flow Corner</strong>
+                <span>Sát góc</span>
+              </button>
+              <button
+                type="button"
+                className={`algo-pill ${activeEntry.presetKey === 'sparkle' ? 'active' : ''}`}
+                onClick={() => handleApplyPreset('sparkle')}
+              >
+                <strong>Sparkle</strong>
+                <span>Kiểu ảnh</span>
+              </button>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: entries.length > 1 ? '1fr 1fr' : '1fr', gap: 8, marginTop: 4 }}>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                style={{ padding: '8px 10px', fontSize: 12 }}
+                onClick={() => void handleAutoDetectAgain()}
+              >
+                <Scan size={14} color="var(--accent-2)" />
+                <span>Auto-Detect</span>
+              </button>
+
+              {entries.length > 1 && (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  style={{ padding: '8px 10px', fontSize: 12 }}
+                  onClick={handleSyncSettingsToAll}
+                  title="Áp dụng thông số slider hiện tại cho tất cả video trong hàng đợi"
+                >
+                  <CopyCheck size={14} color="#34d399" />
+                  <span>Đồng bộ tất cả</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="inspector-section">
+            <div className="section-label">
+              <span>Live Tuner Video</span>
+              <button type="button" className="text-link-btn" onClick={() => void handleAutoDetectAgain()}>
+                <RotateCcw size={12} />
+                <span>Reset</span>
+              </button>
+            </div>
+
+            <div className="slider-row">
+              <div className="slider-header">
+                <span>Độ mạnh Alpha (Gain)</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <button type="button" className="micro-pill-btn" onClick={() => void handleAutoGain()}>
+                    Auto
+                  </button>
+                  <span className="slider-val">{activeEntry.tuner.gain.toFixed(2)}x</span>
+                </div>
+              </div>
+              <input
+                type="range"
+                min={0.1}
+                max={1.8}
+                step={0.02}
+                value={activeEntry.tuner.gain}
+                className="studio-slider"
+                onChange={(e) => updateActiveTuner({ gain: parseFloat(e.target.value) })}
+              />
+            </div>
+
+            <div className="slider-row">
+              <div className="slider-header">
+                <span>Tỉ lệ kích thước (Scale)</span>
+                <span className="slider-val">{activeEntry.tuner.sizeScale.toFixed(2)}x</span>
+              </div>
+              <input
+                type="range"
+                min={0.4}
+                max={2.2}
+                step={0.01}
+                value={activeEntry.tuner.sizeScale}
+                className="studio-slider"
+                onChange={(e) => updateActiveTuner({ sizeScale: parseFloat(e.target.value) })}
+              />
+            </div>
+
+            <div className="slider-row">
+              <div className="slider-header">
+                <span>Dịch ngang (Offset X)</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <button
+                    type="button"
+                    className="micro-pill-btn"
+                    onClick={() => updateActiveTuner({ offsetX: activeEntry.tuner.offsetX - 1 })}
+                  >
+                    -1
+                  </button>
+                  <span className="slider-val">{activeEntry.tuner.offsetX}px</span>
+                  <button
+                    type="button"
+                    className="micro-pill-btn"
+                    onClick={() => updateActiveTuner({ offsetX: activeEntry.tuner.offsetX + 1 })}
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+              <input
+                type="range"
+                min={offXMin}
+                max={offXMax}
+                step={1}
+                value={activeEntry.tuner.offsetX}
+                className="studio-slider"
+                onChange={(e) => updateActiveTuner({ offsetX: parseInt(e.target.value, 10) })}
+              />
+            </div>
+
+            <div className="slider-row">
+              <div className="slider-header">
+                <span>Dịch dọc (Offset Y)</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <button
+                    type="button"
+                    className="micro-pill-btn"
+                    onClick={() => updateActiveTuner({ offsetY: activeEntry.tuner.offsetY - 1 })}
+                  >
+                    -1
+                  </button>
+                  <span className="slider-val">{activeEntry.tuner.offsetY}px</span>
+                  <button
+                    type="button"
+                    className="micro-pill-btn"
+                    onClick={() => updateActiveTuner({ offsetY: activeEntry.tuner.offsetY + 1 })}
+                  >
+                    +1
+                  </button>
+                </div>
+              </div>
+              <input
+                type="range"
+                min={offYMin}
+                max={offYMax}
+                step={1}
+                value={activeEntry.tuner.offsetY}
+                className="studio-slider"
+                onChange={(e) => updateActiveTuner({ offsetY: parseInt(e.target.value, 10) })}
+              />
+            </div>
+          </div>
+
+          <div className="metrics-card">
+            <div className="metrics-row">
+              <span>Độ phân giải</span>
+              <span>
+                {activeEntry.previewFrame.width}×{activeEntry.previewFrame.height} ·{' '}
+                {activeEntry.previewFrame.duration.toFixed(1)}s
+              </span>
+            </div>
+            <div className="metrics-row">
+              <span>Tiến độ hàng đợi</span>
+              <span>
+                {doneCount}/{entries.length} video sạch
+              </span>
+            </div>
+          </div>
+
+          {isExportingBatch && (
+            <div className="inspector-section">
+              <div className="slider-header">
+                <span style={{ fontSize: 11.5 }}>
+                  {batchCounter && batchCounter.total > 1
+                    ? `Video ${batchCounter.current}/${batchCounter.total} · `
+                    : ''}
+                  {activeEntry.phaseLabel || 'Đang xử lý...'}
+                </span>
+                <span className="slider-val">{activeEntry.progressPct}%</span>
+              </div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{ width: `${activeEntry.progressPct}%` }} />
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                Đã khử {activeEntry.framesDone} khung hình · Giữ tab mở để đạt tốc độ tối đa
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 9, marginTop: 'auto' }}>
+            {!isExportingBatch ? (
+              <>
+                {entries.length > 1 ? (
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-lg"
+                    onClick={handleExportAllPending}
+                  >
+                    <Zap size={17} />
+                    <span>
+                      {doneCount === entries.length
+                        ? `Xuất lại toàn bộ (${entries.length} video)`
+                        : `Xóa Logo Hàng Loạt (${entries.length - doneCount} video)`}
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-lg"
+                    onClick={handleExportCurrent}
+                  >
+                    <Sparkles size={17} />
+                    <span>
+                      {activeEntry.result ? 'Xuất lại Video này (.MP4)' : 'Xuất Video MP4 Sạch'}
+                    </span>
+                  </button>
+                )}
+
+                {entries.length > 1 && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-lg"
+                    onClick={handleExportCurrent}
+                  >
+                    <Sparkles size={15} />
+                    <span>Chỉ xuất video đang chọn</span>
+                  </button>
+                )}
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-ghost btn-lg"
+                onClick={() => abortRef.current?.abort()}
+              >
+                <StopCircle size={17} color="#f87171" />
+                <span>Dừng hàng đợi</span>
+              </button>
             )}
-          </div>
-        </div>
 
-        {/* Dual Zoomed Pixel Loupe */}
-        <div className="dual-zoom-bar">
-          <div className="zoom-card">
-            <div className="zoom-card-head">
-              <span className="dot blue" />
-              <span>Khung hình GỐC (Zoom góc logo)</span>
-            </div>
-            <canvas ref={zoomOrigRef} width={220} height={220} />
-          </div>
+            {activeEntry.result && !isExportingBatch && (
+              <button
+                type="button"
+                className="btn btn-success btn-lg"
+                onClick={() => handleDownloadSingle(activeEntry)}
+              >
+                <Download size={16} />
+                <span>Tải Video Này (.MP4)</span>
+              </button>
+            )}
 
-          <div className="zoom-card clean">
-            <div className="zoom-card-head">
-              <span className="dot green" />
-              <span>Khung hình ĐÃ XÓA (Live 60fps)</span>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 6,
+                fontSize: 11,
+                color: 'var(--text-muted)',
+              }}
+            >
+              <Wand2 size={12} />
+              <span>Hàng đợi tự chạy lần lượt để không tràn RAM/GPU</span>
             </div>
-            <canvas ref={zoomCleanRef} width={220} height={220} />
           </div>
-        </div>
+        </aside>
       </div>
 
-      {/* Right Video Live Tuner Controls */}
-      <aside className="inspector-panel glass-panel">
-        <div className="inspector-section">
-          <div className="section-label">
-            <span>Model Preset Video</span>
+      {/* Multi-Video Queue Filmstrip Bar */}
+      <div className="filmstrip-bar glass-panel">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <Layers size={16} color="var(--accent-2)" />
+          <div>
+            <div style={{ fontSize: 12.5, fontWeight: 600 }}>Hàng đợi Video ({entries.length})</div>
+            <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+              Hoàn tất: {doneCount}/{entries.length}
+            </div>
           </div>
-          <div className="algo-list">
-            <button
-              type="button"
-              className={`algo-pill ${presetKey === 'veo' ? 'active' : ''}`}
-              onClick={() => handleApplyPreset('veo')}
+        </div>
+
+        <div className="filmstrip-list">
+          {entries.map((entry) => (
+            <div
+              key={entry.id}
+              className={`thumb-item video-thumb-item ${entry.id === activeEntry.id ? 'active' : ''}`}
+              onClick={() => {
+                setActiveId(entry.id);
+                if (!entry.result && viewMode === 'result') setViewMode('tuner');
+              }}
+              title={`${entry.name} (${entry.previewFrame.width}×${entry.previewFrame.height})`}
             >
-              <strong>Omni / Veo 3</strong>
-              <span>Inset chuẩn</span>
-            </button>
-            <button
-              type="button"
-              className={`algo-pill ${presetKey === 'corner' ? 'active' : ''}`}
-              onClick={() => handleApplyPreset('corner')}
-            >
-              <strong>Flow Corner</strong>
-              <span>Sát góc</span>
-            </button>
-            <button
-              type="button"
-              className={`algo-pill ${presetKey === 'sparkle' ? 'active' : ''}`}
-              onClick={() => handleApplyPreset('sparkle')}
-            >
-              <strong>Sparkle</strong>
-              <span>Kiểu ảnh</span>
-            </button>
-          </div>
+              <img src={entry.thumbUrl} alt={entry.name} />
+              <span className="video-thumb-dur">{entry.previewFrame.duration.toFixed(0)}s</span>
+
+              {!isExportingBatch && (
+                <button
+                  type="button"
+                  className="thumb-remove"
+                  title="Xóa khỏi hàng đợi"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleRemoveEntry(entry.id);
+                  }}
+                >
+                  <X size={11} />
+                </button>
+              )}
+
+              {entry.status === 'done' && (
+                <span className="thumb-status">
+                  <CheckCircle2 size={13} color="#34d399" />
+                </span>
+              )}
+              {entry.status === 'processing' && (
+                <span className="thumb-status" style={{ width: 'auto', padding: '0 5px', fontSize: 9.5, fontWeight: 700, color: '#38bdf8' }}>
+                  {entry.progressPct}%
+                </span>
+              )}
+            </div>
+          ))}
 
           <button
             type="button"
-            className="btn btn-ghost"
-            style={{ width: '100%', marginTop: 4 }}
-            onClick={() => void handleAutoDetectAgain()}
+            className="thumb-add-btn"
+            disabled={isAnalyzing || isExportingBatch}
+            onClick={() => addMoreInputRef.current?.click()}
+            title="Thêm nhiều video vào hàng đợi"
           >
-            <Scan size={15} color="var(--accent-2)" />
-            <span>Quét Tự Động Khung Hình</span>
+            {isAnalyzing ? <Loader2 size={16} className="spin" /> : <Plus size={18} />}
           </button>
         </div>
 
-        <div className="inspector-section">
-          <div className="section-label">
-            <span>Live Tuner Video</span>
-            <button type="button" className="text-link-btn" onClick={() => void handleAutoDetectAgain()}>
-              <RotateCcw size={12} />
-              <span>Reset</span>
-            </button>
-          </div>
-
-          <div className="slider-row">
-            <div className="slider-header">
-              <span>Độ mạnh Alpha (Gain)</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <button type="button" className="micro-pill-btn" onClick={() => void handleAutoGain()}>
-                  Auto
-                </button>
-                <span className="slider-val">{tuner.gain.toFixed(2)}x</span>
-              </div>
-            </div>
-            <input
-              type="range"
-              min={0.1}
-              max={1.8}
-              step={0.02}
-              value={tuner.gain}
-              className="studio-slider"
-              onChange={(e) => setTuner((p) => ({ ...p, gain: parseFloat(e.target.value) }))}
-            />
-          </div>
-
-          <div className="slider-row">
-            <div className="slider-header">
-              <span>Tỉ lệ kích thước (Scale)</span>
-              <span className="slider-val">{tuner.sizeScale.toFixed(2)}x</span>
-            </div>
-            <input
-              type="range"
-              min={0.4}
-              max={2.2}
-              step={0.01}
-              value={tuner.sizeScale}
-              className="studio-slider"
-              onChange={(e) => setTuner((p) => ({ ...p, sizeScale: parseFloat(e.target.value) }))}
-            />
-          </div>
-
-          <div className="slider-row">
-            <div className="slider-header">
-              <span>Dịch ngang (Offset X)</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <button
-                  type="button"
-                  className="micro-pill-btn"
-                  onClick={() => setTuner((p) => ({ ...p, offsetX: p.offsetX - 1 }))}
-                >
-                  -1
-                </button>
-                <span className="slider-val">{tuner.offsetX}px</span>
-                <button
-                  type="button"
-                  className="micro-pill-btn"
-                  onClick={() => setTuner((p) => ({ ...p, offsetX: p.offsetX + 1 }))}
-                >
-                  +1
-                </button>
-              </div>
-            </div>
-            <input
-              type="range"
-              min={offXMin}
-              max={offXMax}
-              step={1}
-              value={tuner.offsetX}
-              className="studio-slider"
-              onChange={(e) => setTuner((p) => ({ ...p, offsetX: parseInt(e.target.value, 10) }))}
-            />
-          </div>
-
-          <div className="slider-row">
-            <div className="slider-header">
-              <span>Dịch dọc (Offset Y)</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <button
-                  type="button"
-                  className="micro-pill-btn"
-                  onClick={() => setTuner((p) => ({ ...p, offsetY: p.offsetY - 1 }))}
-                >
-                  -1
-                </button>
-                <span className="slider-val">{tuner.offsetY}px</span>
-                <button
-                  type="button"
-                  className="micro-pill-btn"
-                  onClick={() => setTuner((p) => ({ ...p, offsetY: p.offsetY + 1 }))}
-                >
-                  +1
-                </button>
-              </div>
-            </div>
-            <input
-              type="range"
-              min={offYMin}
-              max={offYMax}
-              step={1}
-              value={tuner.offsetY}
-              className="studio-slider"
-              onChange={(e) => setTuner((p) => ({ ...p, offsetY: parseInt(e.target.value, 10) }))}
-            />
-          </div>
-        </div>
-
-        <div className="metrics-card">
-          <div className="metrics-row">
-            <span>File Video</span>
-            <span style={{ maxWidth: 170, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {file.name}
-            </span>
-          </div>
-          <div className="metrics-row">
-            <span>Độ phân giải</span>
-            <span>
-              {previewFrame.width}×{previewFrame.height} · {previewFrame.duration.toFixed(1)}s
-            </span>
-          </div>
-        </div>
-
-        {isExporting && (
-          <div className="inspector-section">
-            <div className="slider-header">
-              <span style={{ fontSize: 11.5 }}>{phaseLabel}</span>
-              <span className="slider-val">{progressPct}%</span>
-            </div>
-            <div className="progress-track">
-              <div className="progress-fill" style={{ width: `${progressPct}%` }} />
-            </div>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-              Đã xử lý {framesDone} khung hình · Giữ tab này mở
-            </div>
-          </div>
-        )}
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 'auto' }}>
-          {!isExporting ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          {doneCount >= 2 && !isExportingBatch && (
             <button
               type="button"
-              className="btn btn-primary btn-lg"
-              onClick={() => void handleExportVideo()}
+              className="btn btn-success"
+              disabled={isZipping}
+              onClick={() => void handleDownloadAllZip()}
             >
-              <Sparkles size={17} />
-              <span>Xuất Video MP4 Sạch (H.264 + Audio)</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn btn-ghost btn-lg"
-              onClick={() => abortRef.current?.abort()}
-            >
-              <StopCircle size={17} color="#f87171" />
-              <span>Hủy xuất video</span>
+              {isZipping ? <Loader2 size={15} className="spin" /> : <Download size={15} />}
+              <span>Tải tất cả ZIP ({doneCount})</span>
             </button>
           )}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-            <Wand2 size={12} />
-            <span>Mẹo: Chỉnh slider đến khi ô Zoom phải sạch hoàn toàn rồi bấm Xuất</span>
-          </div>
         </div>
-      </aside>
-    </div>
+      </div>
+    </>
   );
 };
